@@ -1,14 +1,14 @@
+use std::path::PathBuf;
 use std::sync::mpsc::SendError;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use codex_core::codex_wrapper::init_codex;
-use codex_core::protocol::AskForApproval;
+use codex_core::config::Config;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::InputItem;
 use codex_core::protocol::Op;
-use codex_core::protocol::SandboxPolicy;
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
@@ -34,8 +34,7 @@ pub(crate) struct ChatWidget<'a> {
     conversation_history: ConversationHistoryWidget,
     bottom_pane: BottomPane<'a>,
     input_focus: InputFocus,
-    approval_policy: AskForApproval,
-    cwd: std::path::PathBuf,
+    config: Config,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -46,32 +45,25 @@ enum InputFocus {
 
 impl ChatWidget<'_> {
     pub(crate) fn new(
-        approval_policy: AskForApproval,
-        sandbox_policy: SandboxPolicy,
+        config: Config,
         app_event_tx: Sender<AppEvent>,
         initial_prompt: Option<String>,
-        initial_images: Vec<std::path::PathBuf>,
-        model: Option<String>,
+        initial_images: Vec<PathBuf>,
     ) -> Self {
         let (codex_op_tx, mut codex_op_rx) = unbounded_channel::<Op>();
 
-        // Determine the current working directory up‑front so we can display
-        // it alongside the Session information when the session is
-        // initialised.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-
         let app_event_tx_clone = app_event_tx.clone();
         // Create the Codex asynchronously so the UI loads as quickly as possible.
+        let config_for_agent_loop = config.clone();
         tokio::spawn(async move {
-            let (codex, session_event, _ctrl_c) =
-                match init_codex(approval_policy, sandbox_policy, model).await {
-                    Ok(vals) => vals,
-                    Err(e) => {
-                        // TODO(mbolin): This error needs to be surfaced to the user.
-                        tracing::error!("failed to initialize codex: {e}");
-                        return;
-                    }
-                };
+            let (codex, session_event, _ctrl_c) = match init_codex(config_for_agent_loop).await {
+                Ok(vals) => vals,
+                Err(e) => {
+                    // TODO: surface this error to the user.
+                    tracing::error!("failed to initialize codex: {e}");
+                    return;
+                }
+            };
 
             // Forward the captured `SessionInitialized` event that was consumed
             // inside `init_codex()` so it can be rendered in the UI.
@@ -107,8 +99,7 @@ impl ChatWidget<'_> {
                 has_input_focus: true,
             }),
             input_focus: InputFocus::BottomPane,
-            approval_policy,
-            cwd: cwd.clone(),
+            config,
         };
 
         let _ = chat_widget.submit_welcome_message();
@@ -196,7 +187,7 @@ impl ChatWidget<'_> {
     fn submit_user_message_with_images(
         &mut self,
         text: String,
-        image_paths: Vec<std::path::PathBuf>,
+        image_paths: Vec<PathBuf>,
     ) -> std::result::Result<(), SendError<AppEvent>> {
         let mut items: Vec<InputItem> = Vec::new();
 
@@ -235,11 +226,8 @@ impl ChatWidget<'_> {
         match msg {
             EventMsg::SessionConfigured { model } => {
                 // Record session information at the top of the conversation.
-                self.conversation_history.add_session_info(
-                    model,
-                    self.cwd.clone(),
-                    self.approval_policy,
-                );
+                self.conversation_history
+                    .add_session_info(&self.config, model);
                 self.request_redraw()?;
             }
             EventMsg::AgentMessage { message } => {
@@ -361,6 +349,23 @@ impl ChatWidget<'_> {
 
     fn request_redraw(&mut self) -> std::result::Result<(), SendError<AppEvent>> {
         self.app_event_tx.send(AppEvent::Redraw)?;
+        Ok(())
+    }
+
+    pub(crate) fn handle_scroll_delta(
+        &mut self,
+        scroll_delta: i32,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<AppEvent>> {
+        // If the user is trying to scroll exactly one line, we let them, but
+        // otherwise we assume they are trying to scroll in larger increments.
+        let magnified_scroll_delta = if scroll_delta == 1 {
+            1
+        } else {
+            // Play with this: perhaps it should be non-linear?
+            scroll_delta * 2
+        };
+        self.conversation_history.scroll(magnified_scroll_delta);
+        self.request_redraw()?;
         Ok(())
     }
 

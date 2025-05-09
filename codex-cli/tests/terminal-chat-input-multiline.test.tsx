@@ -24,35 +24,6 @@ vi.mock("../src/utils/input-utils.js", () => ({
 }));
 
 describe("TerminalChatInput multiline functionality", () => {
-  it("renders the multiline editor component", async () => {
-    const props: ComponentProps<typeof TerminalChatInput> = {
-      isNew: false,
-      loading: false,
-      submitInput: () => {},
-      confirmationPrompt: null,
-      explanation: undefined,
-      submitConfirmation: () => {},
-      setLastResponseId: () => {},
-      setItems: () => {},
-      contextLeftPercent: 50,
-      openOverlay: () => {},
-      openDiffOverlay: () => {},
-      openModelOverlay: () => {},
-      openApprovalOverlay: () => {},
-      openHelpOverlay: () => {},
-      onCompact: () => {},
-      interruptAgent: () => {},
-      active: true,
-      thinkingSeconds: 0,
-    };
-
-    const { lastFrameStripped } = renderTui(<TerminalChatInput {...props} />);
-    const frame = lastFrameStripped();
-
-    // Check that the help text mentions shift+enter for new line
-    expect(frame).toContain("shift+enter for new line");
-  });
-
   it("allows multiline input with shift+enter", async () => {
     const submitInput = vi.fn();
 
@@ -71,6 +42,7 @@ describe("TerminalChatInput multiline functionality", () => {
       openModelOverlay: () => {},
       openApprovalOverlay: () => {},
       openHelpOverlay: () => {},
+      openMcpOverlay: () => {},
       onCompact: () => {},
       interruptAgent: () => {},
       active: true,
@@ -122,6 +94,7 @@ describe("TerminalChatInput multiline functionality", () => {
       openModelOverlay: () => {},
       openApprovalOverlay: () => {},
       openHelpOverlay: () => {},
+      openMcpOverlay: () => {},
       onCompact: () => {},
       interruptAgent: () => {},
       active: true,

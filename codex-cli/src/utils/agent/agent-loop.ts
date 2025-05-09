@@ -2,6 +2,9 @@ import type { ReviewDecision } from "./review.js";
 import type { ApplyPatchCommand, ApprovalPolicy } from "../../approvals.js";
 import type { AppConfig } from "../config.js";
 import type { ResponseEvent } from "../responses.js";
+import type { ExecInput } from "./sandbox/interface.js";
+import type { MCPManager } from "../mcp/index.js";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type {
   ResponseFunctionToolCall,
   ResponseInputItem,
@@ -11,9 +14,20 @@ import type {
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
 
-import { OPENAI_TIMEOUT_MS, getApiKey, getBaseUrl } from "../config.js";
+import {
+  OPENAI_TIMEOUT_MS,
+  OPENAI_ORGANIZATION,
+  OPENAI_PROJECT,
+  getApiKey,
+  getBaseUrl,
+} from "../config.js";
 import { log } from "../logger/log.js";
-import { parseToolCallArguments } from "../parsers.js";
+import { mcpToOpenaiTools } from "../mcp";
+import { unsanitizeToolName } from "../mcp/utils/sanitizeToolName.js";
+import {
+  parseExecToolCallArguments,
+  parseToolCallArguments,
+} from "../parsers.js";
 import { responsesCreateViaChatCompletions } from "../responses.js";
 import {
   ORIGIN,
@@ -23,14 +37,18 @@ import {
   setSessionId,
 } from "../session.js";
 import { handleExecCommand } from "./handle-exec-command.js";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import { randomUUID } from "node:crypto";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
 
 // Wait time before retrying after rate limit errors (ms).
 const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
-  process.env["OPENAI_RATE_LIMIT_RETRY_WAIT_MS"] || "2500",
+  process.env["OPENAI_RATE_LIMIT_RETRY_WAIT_MS"] || "500",
   10,
 );
+
+// See https://github.com/openai/openai-node/tree/v4?tab=readme-ov-file#configuring-an-https-agent-eg-for-proxies
+const PROXY_URL = process.env["HTTPS_PROXY"];
 
 export type CommandConfirmation = {
   review: ReviewDecision;
@@ -40,6 +58,7 @@ export type CommandConfirmation = {
 };
 
 const alreadyProcessedResponses = new Set();
+const alreadyStagedItemIds = new Set<string>();
 
 type AgentLoopParams = {
   model: string;
@@ -60,6 +79,12 @@ type AgentLoopParams = {
 
   /** Extra writable roots to use with sandbox execution. */
   additionalWritableRoots: ReadonlyArray<string>;
+
+  /** MCP tools to include with the standard tools */
+  mcpTools?: Array<Tool>;
+
+  /** MCP Manager instance for tool execution */
+  mcpManager?: MCPManager;
 
   /** Called when the command is not auto-approved to request explicit user review. */
   getCommandConfirmation: (
@@ -102,6 +127,10 @@ export class AgentLoop {
   private additionalWritableRoots: ReadonlyArray<string>;
   /** Whether we ask the API to persist conversation state on the server */
   private readonly disableResponseStorage: boolean;
+  /** MCP tools to include with standard tools */
+  private readonly mcpTools: Array<Tool>;
+  /** MCP Manager for tool execution */
+  private readonly mcpManager?: MCPManager;
 
   // Using `InstanceType<typeof OpenAI>` sidesteps typing issues with the OpenAI package under
   // the TS 5+ `moduleResolution=bundler` setup. OpenAI client instance. We keep the concrete
@@ -261,6 +290,8 @@ export class AgentLoop {
     getCommandConfirmation,
     onLastResponseId,
     additionalWritableRoots,
+    mcpTools = [],
+    mcpManager,
   }: AgentLoopParams & { config?: AppConfig }) {
     this.model = model;
     this.provider = provider;
@@ -281,6 +312,8 @@ export class AgentLoop {
     this.onLoading = onLoading;
     this.getCommandConfirmation = getCommandConfirmation;
     this.onLastResponseId = onLastResponseId;
+    this.mcpTools = mcpTools;
+    this.mcpManager = mcpManager;
 
     this.disableResponseStorage = disableResponseStorage ?? false;
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
@@ -302,7 +335,12 @@ export class AgentLoop {
         originator: ORIGIN,
         version: CLI_VERSION,
         session_id: this.sessionId,
+        ...(OPENAI_ORGANIZATION
+          ? { "OpenAI-Organization": OPENAI_ORGANIZATION }
+          : {}),
+        ...(OPENAI_PROJECT ? { "OpenAI-Project": OPENAI_PROJECT } : {}),
       },
+      httpAgent: PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined,
       ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
 
@@ -355,12 +393,14 @@ export class AgentLoop {
         (item as any).arguments;
 
     // The OpenAI "function_call" item may have either `call_id` (responses
-    // endpoint) or `id` (chat endpoint).  Prefer `call_id` if present but fall
+    // endpoint) or `id` (chat endpoint). Prefer `call_id` if present but fall
     // back to `id` to remain compatible.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const callId: string = (item as any).call_id ?? (item as any).id;
-
-    const args = parseToolCallArguments(rawArguments ?? "{}");
+    const isExecToolCall = name === "container.exec" || name === "shell";
+    const args = isExecToolCall
+      ? parseExecToolCallArguments(rawArguments ?? "{}")
+      : parseToolCallArguments(rawArguments ?? "{}");
     log(
       `handleFunctionCall(): name=${
         name ?? "undefined"
@@ -398,14 +438,46 @@ export class AgentLoop {
     // used to tell model to stop if needed
     const additionalItems: Array<ResponseInputItem> = [];
 
-    // TODO: allow arbitrary function calls (beyond shell/container.exec)
-    if (name === "container.exec" || name === "shell") {
+    // Check if this is an MCP tool call
+    if (name && name !== "container.exec" && name !== "shell") {
+      // Try to parse the MCP tool name
+      const { serverName, toolName } = unsanitizeToolName(name);
+      if (serverName && toolName && this.mcpManager) {
+        const mcpClient = this.mcpManager.getClientByName(serverName);
+        if (mcpClient && this.mcpManager.isServerConnected(serverName)) {
+          try {
+            log(
+              `Calling MCP tool: ${serverName}:${toolName} with args: ${JSON.stringify(args)}`,
+            );
+            const result = await mcpClient.callTool(toolName, args);
+            outputItem.output = JSON.stringify({ output: result });
+          } catch (error) {
+            log(`Error calling MCP tool ${serverName}:${toolName}: ${error}`);
+            outputItem.output = JSON.stringify({
+              output: `Error calling MCP tool: ${error}`,
+              metadata: { error: true },
+            });
+          }
+          return [outputItem, ...additionalItems];
+        } else {
+          log(`MCP server not connected: ${serverName}`);
+          outputItem.output = JSON.stringify({
+            output: `MCP server not connected: ${serverName}`,
+            metadata: { error: true },
+          });
+          return [outputItem, ...additionalItems];
+        }
+      }
+    }
+
+    // Handle built-in tools (container.exec/shell)
+    if (isExecToolCall) {
       const {
         outputText,
         metadata,
         additionalItems: additionalItemsFromExec,
       } = await handleExecCommand(
-        args,
+        args as ExecInput,
         this.config,
         this.approvalPolicy,
         this.additionalWritableRoots,
@@ -552,17 +624,27 @@ export class AgentLoop {
           return;
         }
 
+        // Skip items we've already processed to avoid staging duplicates
+        if (item.id && alreadyStagedItemIds.has(item.id)) {
+          return;
+        }
+        alreadyStagedItemIds.add(item.id);
+
         // Store the item so the final flush can still operate on a complete list.
         // We'll nil out entries once they're delivered.
         const idx = staged.push(item) - 1;
 
         // Instead of emitting synchronously we schedule a short‑delay delivery.
+        //
         // This accomplishes two things:
         //   1. The UI still sees new messages almost immediately, creating the
         //      perception of real‑time updates.
         //   2. If the user calls `cancel()` in the small window right after the
         //      item was staged we can still abort the delivery because the
         //      generation counter will have been bumped by `cancel()`.
+        //
+        // Use a minimal 3ms delay for terminal rendering to maintain readable
+        // streaming.
         setTimeout(() => {
           if (
             thisGeneration === this.generation &&
@@ -573,8 +655,9 @@ export class AgentLoop {
             // Mark as delivered so flush won't re-emit it
             staged[idx] = undefined;
 
-            // When we operate without server‑side storage we keep our own
-            // transcript so we can provide full context on subsequent calls.
+            // Handle transcript updates to maintain consistency. When we
+            // operate without server‑side storage we keep our own transcript
+            // so we can provide full context on subsequent calls.
             if (this.disableResponseStorage) {
               // Exclude system messages from transcript as they do not form
               // part of the assistant/user dialogue that the model needs.
@@ -618,7 +701,7 @@ export class AgentLoop {
               }
             }
           }
-        }, 10);
+        }, 3); // Small 3ms delay for readable streaming.
       };
 
       while (turnInput.length > 0) {
@@ -636,7 +719,7 @@ export class AgentLoop {
         // prompts) and so that freshly generated `function_call_output`s are
         // shown immediately.
         // Figure out what subset of `turnInput` constitutes *new* information
-        // for the UI so that we don’t spam the interface with repeats of the
+        // for the UI so that we don't spam the interface with repeats of the
         // entire transcript on every iteration when response storage is
         // disabled.
         const deltaInput = this.disableResponseStorage
@@ -645,16 +728,16 @@ export class AgentLoop {
         for (const item of deltaInput) {
           stageItem(item as ResponseItem);
         }
-        // Send request to OpenAI with retry on timeout
+        // Send request to OpenAI with retry on timeout.
         let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
-        const MAX_RETRIES = 5;
+        const MAX_RETRIES = 8;
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
             let reasoning: Reasoning | undefined;
             if (this.model.startsWith("o")) {
-              reasoning = { effort: "high" };
+              reasoning = { effort: this.config.reasoningEffort ?? "high" };
               if (this.model === "o3" || this.model === "o4-mini") {
                 reasoning.summary = "auto";
               }
@@ -662,6 +745,12 @@ export class AgentLoop {
             const mergedInstructions = [prefix, this.instructions]
               .filter(Boolean)
               .join("\n");
+
+            // Combine shell tool with MCP tools
+            const allTools: Array<FunctionTool> = [
+              shellTool,
+              ...mcpToOpenaiTools(this.mcpTools),
+            ];
 
             const responseCall =
               !this.config.provider ||
@@ -692,7 +781,7 @@ export class AgentLoop {
                     store: true,
                     previous_response_id: lastResponseId || undefined,
                   }),
-              tools: [shellTool],
+              tools: allTools,
               // Explicitly tell the model it is allowed to pick whatever
               // tool it deems appropriate.  Omitting this sometimes leads to
               // the model ignoring the available tools and responding with
@@ -878,7 +967,7 @@ export class AgentLoop {
         // Keep track of the active stream so it can be aborted on demand.
         this.currentStream = stream;
 
-        // guard against an undefined stream before iterating
+        // Guard against an undefined stream before iterating.
         if (!stream) {
           this.onLoading(false);
           log("AgentLoop.run(): stream is undefined");
@@ -1115,7 +1204,7 @@ export class AgentLoop {
                 content: [
                   {
                     type: "input_text",
-                    text: "⚠️ Insufficient quota. Please check your billing details and retry.",
+                    text: `\u26a0 Insufficient quota: ${err instanceof Error && err.message ? err.message.trim() : "No remaining quota."} Manage or purchase credits at https://platform.openai.com/account/billing.`,
                   },
                 ],
               });
@@ -1196,8 +1285,18 @@ export class AgentLoop {
         this.onLoading(false);
       };
 
-      // Delay flush slightly to allow a near‑simultaneous cancel() to land.
-      setTimeout(flush, 30);
+      // Use a small delay to make sure UI rendering is smooth. Double-check
+      // cancellation state right before flushing to avoid race conditions.
+      setTimeout(() => {
+        if (
+          !this.canceled &&
+          !this.hardAbort.signal.aborted &&
+          thisGeneration === this.generation
+        ) {
+          flush();
+        }
+      }, 3);
+
       // End of main logic. The corresponding catch block for the wrapper at the
       // start of this method follows next.
     } catch (err) {
@@ -1448,6 +1547,7 @@ You MUST adhere to the following criteria when executing the task:
 - Analyzing code for vulnerabilities is allowed.
 - Showing user code and tool call details is allowed.
 - User instructions may overwrite the *CODING GUIDELINES* section in this developer message.
+- Use the tools available at full capacity when completing the user's task. Think of tools as a way to extend your capabilities, not as a crutch, understand the user's request and use the tools if a tool can be used to complete the task.
 - Use \`apply_patch\` to edit files: {"cmd":["apply_patch","*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ def example():\\n-  pass\\n+  return 123\\n*** End Patch"]}
 - If completing the user's task requires writing or modifying files:
     - Your code and final answer should follow these *CODING GUIDELINES*:
